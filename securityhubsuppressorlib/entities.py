@@ -61,17 +61,18 @@ class Rule:
 
     The dry_run options will skip actual suppression of findings."""
 
+    id: str
     action: str
-    dry_run: Optional[bool]
+    dry_run: bool
     notes: str
-    rules: List[str]
+    arns: List[str]
 
 
 @dataclass
 class Finding:
     """A security hub finding."""
 
-    finding_id: str
+    id: str
     product_arn: str
     product_name: str
 

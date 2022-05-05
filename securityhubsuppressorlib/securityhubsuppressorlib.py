@@ -88,51 +88,48 @@ class Suppressor:
     """
 
     def __init__(self) -> None:
-        self._securityhub_client = boto3.client('securityhub')
+        self._security_hub_client = boto3.client('securityhub')
         self._dynamodb_resource = boto3.resource('dynamodb')
 
-    def find_rule(self) -> Optional[SuppressionRule]:
-        # get_rule_by_id(id) -> Rule
+    def find_rule_by_resource_id(self, resource_id) -> Union[Rule, None]:
+        # find_rule_by_resource_id(id) -> Rule
+
         """
         Finds a rule that matches with the finding within the list of
         suppression rules. Suppression rules can be matched by a regular
         expression on the resource id that the finding applies on.
         """
 
-        for entry in self.suppression_list.entries:
-            match = next((rule for rule in entry.rules if search(rule, self.resource_id)), None)
+        for rule in self.rules:
+            match = next((arn for arn in rule.arns if search(rule, resource_id)), None)
             if match:
-                self.matched_rule = match
-                return entry
+                return rule
         return None
 
-    find_rule_by_resource_id(id) -> Rule
+    def get_rule_by_id(self, rule_id) -> Union[Rule, None]:
+        # get_rule_by_id(id) -> Rule
+        return next((rule for rule in self.rules if rule.id == rule_id, None)
+
+
     enable_product(**product_info) -> Boolean
     list_enabled_products() -> [Product]
-    get_findings_by_rule_id(id) -> [Findings]
 
-    def get_findings(control_value: str, securityhub_client) -> List[dict]:
+    def get_findings_by_rule_id(self, rule_id) -> List[dict]:
+        # get_findings_by_rule_id(id) -> [Findings]
         """
         Retrieve all findings for a specific control.
         """
-
-        paginator = securityhub_client.get_paginator('get_findings')
-
-        findings = []
+        paginator = self.security_hub_client.get_paginator('get_findings')
         findings_pages = paginator.paginate(
             Filters={
                 'ProductFields': [
-                    {'Key': 'RuleId', 'Value': control_value, 'Comparison': 'EQUALS'},
-                    {'Key': 'ControlId', 'Value': control_value, 'Comparison': 'EQUALS'}
+                    {'Key': 'RuleId', 'Value': rule_id, 'Comparison': 'EQUALS'},
+                    {'Key': 'ControlId', 'Value': rule_id, 'Comparison': 'EQUALS'}
                 ],
                 'ComplianceStatus': [{'Value': 'FAILED', 'Comparison': 'EQUALS'}],
             }
         )
-
-        for findings_page in findings_pages:
-            findings.extend(findings_page.get('Findings'))
-
-        return findings
+        return [findings_page.get('Findings') for findings_page in findings_pages]
 
     @staticmethod
     def get_finding_details(finding_event: Dict[str, Any], product_name: str) -> Tuple[None, None]:
@@ -154,7 +151,7 @@ class Suppressor:
         return key, status
 
     @property
-    def entries(self) -> list:
+    def rules(self) -> list:
         # get_suppression_rules() -> [Rule]
         """
         Collect suppression rule entries from DynamoDB, skipping
@@ -242,7 +239,7 @@ class Suppressor:
         if self.rule.dry_run:
             return True
 
-        return self._securityhub_client.batch_update_findings(
+        return self._security_hub_client.batch_update_findings(
             FindingIdentifiers=[{
                 'Id': self.finding.finding_id,
                 'ProductArn': self.finding.product_arn
