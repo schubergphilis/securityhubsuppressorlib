@@ -23,3 +23,9 @@ emoji = "~=0.5.3"
 toml = "~=0.10.0"
 
 [packages]
+
+aws-lambda-powertools = "*"
+boto3 = "*"
+jmespath = "*"
+pyyaml = "*"
+yamllint = "*"
