@@ -31,9 +31,13 @@ Main code for securityhubsuppressorlib.
 
 """
 
+import argparse
 import boto3
+import coloredlogs
 import jmespath
+import logging
 import os
+import sys
 import yaml
 from aws_lambda_powertools import Logger
 from aws_lambda_powertools.utilities.data_classes import DynamoDBStreamEvent
@@ -41,6 +45,7 @@ from aws_lambda_powertools.utilities.data_classes import EventBridgeEvent
 from aws_lambda_powertools.utilities.data_classes.dynamo_db_stream_event import DynamoDBRecordEventName
 from aws_lambda_powertools.utilities.typing import LambdaContext
 from datetime import datetime
+from os import getenv
 from parser import ParserError
 from re import search
 from typing import Any
@@ -87,32 +92,61 @@ class Suppressor:
     Suppresses a single finding if a suppression rule from the provided suppression list can be matched.
     """
 
-    def __init__(self) -> None:
-        self._security_hub_client = boto3.client('securityhub')
-        self._dynamodb_resource = boto3.resource('dynamodb')
+    def __init__(self, dynamodb_table_name) -> None:
+        self._security_hub_client = self._get_security_hub_client()
+        self._dynamodb_resource = self._get_dynamodb_client()
+        self._dynamodb_table_name = dynamodb_table_name
 
-    def find_rule_by_resource_id(self, resource_id) -> Union[Rule, None]:
-        # find_rule_by_resource_id(id) -> Rule
+    def _get_security_hub_client(self):
+        return boto3.client('securityhub')
 
+    def _get_dynamodb_client(self):
+        return boto3.client('dynamodb')
+
+    @property
+    def _suppression_dynamodb_table(self):
+        """
+        The DynamoDB table resource in AWS.
+        """
+
+        return self._dynamodb_resource.Table(name=self._dynamodb_table_name)
+
+    @property
+    def rules(self) -> [Rule]:
+        # get_suppression_rules() -> [Rule]
+        """
+        Collect suppression rule entries from DynamoDB, skipping
+        invalid entries and caching the list of entries when handling
+        multiple findings. A single control can have have multiple suppression
+        rules.
+        """
+        response = self._suppression_dynamodb_table.scan()
+        data = response['Items']
+
+        while 'LastEvaluatedKey' in response:
+            response = self._suppression_dynamodb_table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+            data.extend(response['Items'])
+
+        rules = self._suppression_dynamodb_table.get_item(Key={"controlId": self.hash_key})
+        for rule in rules.get('Item', {}).get('data', {}):
+            self._entries.append(
+                Rule(action=rule.get('action'),
+                     rules=rule.get('rules'),
+                     notes=rule.get('notes'),
+                     dry_run=rule.get('dry_run', False))
+            )
+        return self._entries
+
+    def get_rule_by_id(self, rule_id) -> Union[Rule, None]:
+        return next((rule for rule in self.rules if rule.id == rule_id), None)
+
+    def get_rules_by_resource_id(self, resource_id) -> Union[Rule, None]:
         """
         Finds a rule that matches with the finding within the list of
         suppression rules. Suppression rules can be matched by a regular
         expression on the resource id that the finding applies on.
         """
-
-        for rule in self.rules:
-            match = next((arn for arn in rule.arns if search(rule, resource_id)), None)
-            if match:
-                return rule
-        return None
-
-    def get_rule_by_id(self, rule_id) -> Union[Rule, None]:
-        # get_rule_by_id(id) -> Rule
-        return next((rule for rule in self.rules if rule.id == rule_id, None)
-
-
-    enable_product(**product_info) -> Boolean
-    list_enabled_products() -> [Product]
+        return [rule for rule in self.rules if rule.is_resource_in_rule(resource_id)]
 
     def get_findings_by_rule_id(self, rule_id) -> List[dict]:
         # get_findings_by_rule_id(id) -> [Findings]
@@ -149,35 +183,6 @@ class Suppressor:
         key = jmespath.search(yaml_config.get(product_name, {}).get('key'), finding_event)
         status = jmespath.search(yaml_config.get(product_name, {}).get('status'), finding_event)
         return key, status
-
-    @property
-    def rules(self) -> list:
-        # get_suppression_rules() -> [Rule]
-        """
-        Collect suppression rule entries from DynamoDB, skipping
-        invalid entries and caching the list of entries when handling
-        multiple findings. A single control can have have multiple suppression
-        rules.
-        """
-
-        if not self.hash_key:
-            logger.info('Invalid hash key: %s', self.hash_key)
-            return self._entries
-        if not self._entries:
-            logger.info(
-                'Fetching suppression list from table %s, hash key: %s',
-                DYNAMODB_TABLE_NAME,
-                self.hash_key)
-
-            rules = self.table.get_item(Key={"controlId": self.hash_key})
-            for rule in rules.get('Item', {}).get('data', {}):
-                self._entries.append(
-                    Rule(action=rule.get('action'),
-                         rules=rule.get('rules'),
-                         notes=rule.get('notes'),
-                         dry_run=rule.get('dry_run', False))
-                )
-        return self._entries
 
     @staticmethod
     def validate_finding(finding_event: Dict[str, Any]) -> Union[bool, Finding]:
@@ -252,8 +257,6 @@ class Suppressor:
             }
         )
 
-    create_rule(**rule_info) -> Boolean
-
     def validate_event(event: EventBridgeEvent):
         """
         Validate whether the event is valid by checking whether it matches:
@@ -276,6 +279,59 @@ class Suppressor:
             if workflow_status == "SUPPRESSED":
                 raise ValueError(f'Suppression skipped: workflow status is {workflow_status}')
         return True
+
+    def upsert_existing_suppression_rules(suppressor_table_name: str, desired_rules: dict, dynamodb_client) -> int:
+        upserted_rules = 0
+        for control_id in desired_rules.get("Suppressions", {}):
+            dynamodb_client.put_item(
+                TableName=suppressor_table_name,
+                Item={
+                    "controlId": {
+                        "S": control_id
+                    },
+                    "data": {
+                        "L": [
+                            {
+                                "M": {
+                                    "action": {"S": item["action"]},
+                                    "rules": {"SS": item["rules"]},
+                                    "notes": {"S": item["notes"]}
+                                }
+                            }
+                            for item in desired_rules["Suppressions"][control_id]
+                        ]
+                    }
+                }
+            )
+            LOG.info('Upserted rule with control ID %s in suppression table.', control_id)
+            upserted_rules += 1
+
+        return upserted_rules
+
+    def remove_obsolete_suppression_rules(suppressor_table_name: str, desired_rules: dict, dynamodb_client) -> int:
+        current_rules_paginator = dynamodb_client.get_paginator("scan")
+        current_rules_pages = current_rules_paginator.paginate(
+            TableName=suppressor_table_name
+        )
+
+        desired_suppressed_controls = desired_rules.get("Suppressions", {}).keys()
+        removed_rules = 0
+        for current_rules_page in current_rules_pages:
+            for item in current_rules_page.get("Items", []):
+                if item["controlId"]["S"] not in desired_suppressed_controls:
+                    dynamodb_client.delete_item(
+                        TableName=suppressor_table_name,
+                        Key={
+                            "controlId": {"S": item["controlId"]["S"]}
+                        }
+                    )
+                    LOG.info('Removed rule with control ID %s from suppression table', item["controlId"]["S"])
+                    removed_rules += 1
+        return removed_rules
+
+    enable_product(**product_info) -> Boolean
+    list_enabled_products() -> [Product]
+    create_rule(**rule_info) -> Boolean
 
 def get_file_contents(file_name: str) -> Any:
     """
@@ -411,3 +467,59 @@ def main(event: Dict[str, Any], _context) -> None:
     securityhub_client = boto3.client('securityhub')  # pragma: no cover
     total_suppressions = process_stream_event(event, securityhub_client)
     logger.info('Total findings suppressed: %i', total_suppressions)
+
+
+
+
+DEFAULT_LOGLEVEL = 'INFO'
+DEFAULT_REGION = 'eu-west-1'
+DEFAULT_STAGE = 'dev'
+DEFAULT_SUPPRESION_FILE = 'suppressions.yml'
+DEFAULT_SUPPRESSOR_TABLE_NAME_PREFIX = 'dbt-securityhub-suppression-list'
+LOG = logging.getLogger(__name__)
+
+coloredlogs.install(
+    level=getenv("LOGLEVEL") or DEFAULT_LOGLEVEL,
+    logger=LOG
+)
+
+
+def read_suppression_rules_from_config(config_file: str) -> dict:
+    try:
+        with open(config_file, 'r', encoding='utf-8') as f:
+            suppressions = yaml.safe_load(f.read())
+        return suppressions
+    except FileNotFoundError:
+        LOG.error('Suppression file %s could not be found.', config_file)
+        return {}
+
+
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--audit-account-id', dest='audit_account_id', required=True)
+    parser.add_argument('--region', dest='region', default=DEFAULT_REGION)
+    parser.add_argument('--stage', dest='stage', default=DEFAULT_STAGE)
+    parser.add_argument('--suppression-file', dest='suppression_file', default=DEFAULT_SUPPRESION_FILE)
+    parser.add_argument('--suppressor-table-name', dest='suppressor_table_name')
+
+    args = parser.parse_args()
+
+    if not args.suppressor_table_name:
+        args.suppressor_table_name = f'{DEFAULT_SUPPRESSOR_TABLE_NAME_PREFIX}-{args.stage}'
+
+    LOG.info('Upserting suppressions in %s from %s.', args.suppressor_table_name, args.suppression_file)
+
+    dynamodb_client = boto3.client("dynamodb", region_name=args.region)
+
+    desired_rules = read_suppression_rules_from_config(args.suppression_file)
+
+    if not desired_rules:
+        sys.exit(1)
+
+    upserted_rules = upsert_existing_suppression_rules(args.suppressor_table_name, desired_rules, dynamodb_client)
+    removed_rules = remove_obsolete_suppression_rules(args.suppressor_table_name, desired_rules, dynamodb_client)
+    LOG.info('Upserted %i rules, removed %i rules', upserted_rules, removed_rules)
+
+    sys.exit(0)

@@ -33,8 +33,8 @@ Main code for entities.
 """
 
 import logging
-
 from dataclasses import dataclass
+from re import search
 from typing import List
 from typing import Optional
 
@@ -66,7 +66,10 @@ class Rule:
     dry_run: bool
     notes: str
     arns: List[str]
+    control_id: str
 
+    def is_resource_in_rule(self, resource_id):
+        return bool(next((arn for arn in self.arns if search(arn, resource_id)), None))
 
 @dataclass
 class Finding:
